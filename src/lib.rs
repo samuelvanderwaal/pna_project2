@@ -5,7 +5,7 @@
 #[macro_use]
 extern crate failure;
 
-use std::io::{Write, BufReader};
+use std::io::{Seek, SeekFrom, Write, BufReader};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::fs::{File, OpenOptions};
@@ -21,24 +21,13 @@ enum KvCommand {
     Rm(String),
 }
 
-#[derive(Serialize, Deserialize)]
-struct Record {
-    key: String,
-    value: String,
-}
-
-// impl Record {
-//     fn new() -> Record {
-//         Record { key: String::from(""), value: String::from("") }
-//     }
-// }
-
 /// The struct that stores values.
 /// Its "values" field is a HashMap of String keys and values.
 pub struct KvStore {
     /// Where our in-memory database is stored.
-    pub file_handle: PathBuf,
-    pub log: HashMap<String, String>,
+    pub log_name: PathBuf,
+    pub log: HashMap<String, u64>,
+    pub cursor: u64,
 }
 
 impl KvStore {
@@ -49,7 +38,7 @@ impl KvStore {
     /// ```
     // pub fn new() -> KvStore {
     //     KvStore {
-    //         file_handle: File::new(),
+    //         log_name: File::new(),
     //         log: HashMap::new(),
     //     }
     // }
@@ -58,13 +47,14 @@ impl KvStore {
         let path = path.as_ref();
         let log_name = path.to_path_buf().join("test_db.log");
         let log = HashMap::new();
+        let cursor = 0;
 
-        // let file_handle = OpenOptions::new()
+        // let log_name = OpenOptions::new()
         //             .create(true)
         //             .append(true)
         //             .open(log_name)?;
 
-        Ok(KvStore { file_handle: log_name, log })
+        Ok(KvStore { log_name, log, cursor  })
     }
 
     /// The getter function for values.
@@ -74,15 +64,35 @@ impl KvStore {
     /// db.get("key".to_string());
     /// ```
     pub fn get(&mut self, key: String) -> Result<Option<String>> {
-        if !&self.file_handle.exists() {
+        if !&self.log_name.exists() {
             return Ok(None)
         }
 
-        self.read_log_to_memory()?;
+        // 
+        self.read_log_to_memory(self.cursor)?;
 
-        match self.log.get(&key) {
-            Some(value) => Ok(Some(value.clone())),
-            None => Ok(None)
+        let f = File::open(&self.log_name)?;
+        let mut buf = BufReader::new(f);
+        let mut value = String::new();
+
+        if self.log.contains_key(&key) {
+
+            // Read from log at key's pointer value.
+            // We use expect because we just checked for the key's existence.
+            let log_pointer = self.log.get(&key).expect("No key!");
+            buf.seek(SeekFrom::Start(*log_pointer))?;
+
+            if let Ok(document) = bson::decode_document(&mut buf) {
+                let command: KvCommand = bson::from_bson(bson::Bson::Document(document))?;
+                value = match command {
+                    KvCommand::Set(_, value) => value,
+                    _ => panic!("Invalid log offset!"),
+                };
+            }
+            return Ok(Some(value))
+
+        } else {
+            Ok(None)
         }
     }
 
@@ -96,7 +106,7 @@ impl KvStore {
         let mut f = OpenOptions::new()
                     .create(true)
                     .append(true)
-                    .open(&self.file_handle)?; 
+                    .open(&self.log_name)?; 
        
         let command = KvCommand::Set(key.to_string(), value.to_string());
         write_bson_record(command, &mut f)?;
@@ -110,7 +120,7 @@ impl KvStore {
     /// db.remove("key1".to_string())
     /// ```
     pub fn remove<S: ToString>(&mut self, key: S) -> Result<()> {
-        self.read_log_to_memory()?;
+        self.read_log_to_memory(self.cursor)?;
 
         if !self.log.contains_key(&key.to_string()) {
             bail!("Key not found")
@@ -120,28 +130,29 @@ impl KvStore {
         let mut f = OpenOptions::new()
                     .create(true)
                     .append(true)
-                    .open(&self.file_handle)?; 
+                    .open(&self.log_name)?; 
 
         write_bson_record(command, &mut f)?;
         Ok(())
     }
 
-    fn read_log_to_memory(&mut self) -> Result<()> {
-        let f = File::open(&self.file_handle)?;
+    fn read_log_to_memory(&mut self, offset: u64) -> Result<()> {
+        let f = File::open(&self.log_name)?;
         let mut buf = BufReader::new(f);
+        buf.seek(SeekFrom::Start(offset))?;
 
         while let Ok(document) = bson::decode_document(&mut buf) {
             let command: KvCommand = bson::from_bson(bson::Bson::Document(document))?;
-
             match command {
-                KvCommand::Set(key, value) => {
+                KvCommand::Set(key, _) => {
                     self.log
-                        .insert(key, value);
+                        .insert(key, self.cursor);
                     },
                 KvCommand::Rm(key) => {
                     self.log.remove(&key).ok_or(format_err!("Missing key value!"))?;
                 }
             }
+            self.cursor = buf.seek(SeekFrom::Current(0))?;
         }
         Ok(())
     }
