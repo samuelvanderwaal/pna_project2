@@ -10,8 +10,8 @@ use failure::Error;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fs::{File, OpenOptions};
-use std::io::{BufReader, Seek, SeekFrom, Write};
-use std::path::{Path, PathBuf};
+use std::io::{BufReader, Seek, SeekFrom, Read, Write};
+use std::path::{Path};
 
 pub type Result<T> = std::result::Result<T, Error>;
 
@@ -25,20 +25,29 @@ enum KvCommand {
 /// Its "values" field is a HashMap of String keys and values.
 pub struct KvStore {
     /// Where our in-memory database is stored.
-    pub log_name: PathBuf,
+    pub file_handle: File,
     pub log: HashMap<String, u64>,
     pub cursor: u64,
 }
 
 impl KvStore {
     pub fn open<P: AsRef<Path>>(path: P) -> Result<KvStore> {
-        let path = path.as_ref();
-        let log_name = path.to_path_buf().join("test_db.log");
+        // Convert our generic to a Path and then add database name to it.
+        let path = path.as_ref().join("test_db.log");
+
+        // In-memory database
         let log = HashMap::new();
         let cursor = 0;
 
+
+        let file_handle = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .read(true)
+            .open(path)?;
+
         Ok(KvStore {
-            log_name,
+            file_handle,
             log,
             cursor,
         })
@@ -51,15 +60,9 @@ impl KvStore {
     /// db.get("key".to_string());
     /// ```
     pub fn get(&mut self, key: String) -> Result<Option<String>> {
-        if !&self.log_name.exists() {
-            return Ok(None);
-        }
-
-        //
         self.read_log_to_memory(self.cursor)?;
 
-        let f = File::open(&self.log_name)?;
-        let mut buf = BufReader::new(f);
+        let mut buf = BufReader::new(&mut self.file_handle);
         let mut value = String::new();
 
         if self.log.contains_key(&key) {
@@ -88,13 +91,8 @@ impl KvStore {
     /// db.set("key1".to_string(), "value1".to_string())
     /// ```
     pub fn set<S: ToString>(&mut self, key: S, value: S) -> Result<()> {
-        let mut f = OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&self.log_name)?;
-
         let command = KvCommand::Set(key.to_string(), value.to_string());
-        write_bson_record(command, &mut f)?;
+        write_bson_record(command, &mut self.file_handle)?;
         Ok(())
     }
 
@@ -112,18 +110,12 @@ impl KvStore {
         }
 
         let command = KvCommand::Rm(key.to_string());
-        let mut f = OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&self.log_name)?;
-
-        write_bson_record(command, &mut f)?;
+        write_bson_record(command, &mut self.file_handle)?;
         Ok(())
     }
 
     fn read_log_to_memory(&mut self, offset: u64) -> Result<()> {
-        let f = File::open(&self.log_name)?;
-        let mut buf = BufReader::new(f);
+        let mut buf = BufReader::new(&mut self.file_handle);
         buf.seek(SeekFrom::Start(offset))?;
 
         while let Ok(document) = bson::decode_document(&mut buf) {
